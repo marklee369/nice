@@ -1,4 +1,4 @@
-name = "code" # 您的Worker名称，需Cloudflare账户中唯一
+name = "text" # 您的Worker名称，需Cloudflare账户中唯一
 main = "src/index.js"
 compatibility_date = "2025-06-01" # 或更新的日期
 
