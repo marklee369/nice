@@ -3,85 +3,177 @@ import { cors } from 'hono/cors';
 
 const app = new Hono();
 
-// CORS 中间件配置
-// 注意：在生产环境中，应将 origin 设置为您的确切前端域名
+// ==================== 配置常量 ====================
+const CONFIG = {
+  MAX_PAYLOAD_SIZE: 2000000, // 2MB
+  ID_LENGTH: 16,
+  MAX_ID_LENGTH: 32,
+  MIN_TTL: 60,
+  DEFAULT_TTL: 24 * 60 * 60,
+  READ_ONCE_TTL: 24 * 60 * 60,
+  ALLOWED_ORIGINS: [
+    'https://code.niceo.de',
+  ],
+  TTL_MAP: {
+    '5min': 5 * 60,
+    '30min': 30 * 60,
+    '1hour': 60 * 60,
+    '6hour': 6 * 60 * 60,
+    '1day': 24 * 60 * 60,
+  }
+};
+
+// ==================== CORS 中间件配置 ====================
 app.use('/api/*', cors({
   origin: (origin) => {
-    // 允许来自 localhost (不同端口) 和您指定的生产域名的请求
-    const allowedOrigins = [
-      'https://code.niceo.de',
-      // 在这里添加您的生产环境前端域名
-      // 例如: 'https://your-app-domain.com'
-    ];
-    if (allowedOrigins.includes(origin)) {
+
+    if (CONFIG.ALLOWED_ORIGINS.includes(origin)) {
       return origin;
     }
-    return null; // 其他来源将被拒绝
+    
+    return null;
   },
   allowMethods: ['POST', 'GET', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization'], // 如果未来需要认证头
-  maxAge: 600, // 预检请求的缓存时间
+  allowHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 600,
 }));
 
+// ==================== 工具函数 ====================
 
-// 生成唯一ID
-function generateId(length = 16) {
+/**
+ * 生成唯一ID - 使用加密安全的随机数
+ */
+function generateId(length = CONFIG.ID_LENGTH) {
   const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let result = '';
   const charactersLength = characters.length;
+  let result = '';
+  
+  // 使用加密安全的随机数生成器
+  const randomValues = new Uint8Array(length);
+  crypto.getRandomValues(randomValues);
+  
   for (let i = 0; i < length; i++) {
-    result += characters.charAt(Math.floor(Math.random() * charactersLength));
+    result += characters.charAt(randomValues[i] % charactersLength);
   }
+  
   return result;
 }
 
+/**
+ * 验证加密负载
+ */
+function validatePayload(encryptedPayload) {
+  if (!encryptedPayload) {
+    return { valid: false, error: 'Encrypted payload is required' };
+  }
+  
+  if (typeof encryptedPayload !== 'string') {
+    return { valid: false, error: 'Invalid payload type' };
+  }
+  
+  if (encryptedPayload.length === 0) {
+    return { valid: false, error: 'Payload cannot be empty' };
+  }
+  
+  if (encryptedPayload.length > CONFIG.MAX_PAYLOAD_SIZE) {
+    return { valid: false, error: 'Invalid payload or payload too large' };
+  }
+  
+  return { valid: true };
+}
+
+/**
+ * 验证 Secret ID
+ */
+function validateSecretId(id) {
+  if (!id) {
+    return { valid: false, error: 'Secret ID is required' };
+  }
+  
+  if (typeof id !== 'string') {
+    return { valid: false, error: 'Invalid secret ID type' };
+  }
+  
+  if (id.length > CONFIG.MAX_ID_LENGTH) {
+    return { valid: false, error: 'Invalid secret ID format' };
+  }
+  
+  // 只允许字母数字字符
+  if (!/^[A-Za-z0-9]+$/.test(id)) {
+    return { valid: false, error: 'Invalid secret ID format' };
+  }
+  
+  return { valid: true };
+}
+
+/**
+ * 获取有效的 TTL
+ */
+function getEffectiveTTL(expiryOption, readOnce) {
+  let effectiveKvTtl;
+  
+  if (readOnce) {
+    effectiveKvTtl = CONFIG.READ_ONCE_TTL;
+  } else {
+    effectiveKvTtl = CONFIG.TTL_MAP[expiryOption] || CONFIG.DEFAULT_TTL;
+  }
+  
+  // KV TTL 有最小值60秒的限制
+  return Math.max(effectiveKvTtl, CONFIG.MIN_TTL);
+}
+
+// ==================== API 路由 ====================
+
 app.post('/api/create', async (c) => {
   try {
-    const { encryptedPayload, expiryOption, readOnce } = await c.req.json();
-
-    if (!encryptedPayload) {
-      return c.json({ error: 'Encrypted payload is required' }, 400);
+    let body;
+    try {
+      body = await c.req.json();
+    } catch (parseError) {
+      return c.json({ error: 'Invalid JSON format' }, 400);
     }
-    if (typeof encryptedPayload !== 'string' || encryptedPayload.length > 2000000) { // 限制大小，例如2MB
-        return c.json({ error: 'Invalid payload or payload too large' }, 400);
+    
+    const { encryptedPayload, expiryOption, readOnce } = body;
+    
+    // 验证负载
+    const validation = validatePayload(encryptedPayload);
+    if (!validation.valid) {
+      return c.json({ error: validation.error }, 400);
     }
-
-
-    const secretId = generateId();
+    
+    // 生成唯一ID（带冲突检测）
+    let secretId;
+    let attempts = 0;
+    const maxAttempts = 3;
+    
+    do {
+      secretId = generateId();
+      const existing = await c.env.SECRETS_KV.get(secretId);
+      if (!existing) break;
+      attempts++;
+    } while (attempts < maxAttempts);
+    
+    if (attempts >= maxAttempts) {
+      console.error('Failed to generate unique ID after multiple attempts');
+      return c.json({ error: 'Failed to create secret' }, 500);
+    }
+    
     const creationTime = Date.now();
-    let effectiveKvTtl; // KV条目的TTL (秒)
-
-    if (readOnce) {
-      // 对于阅后即焚，也设置一个服务器端TTL，比如1天，防止链接从未被访问
-      effectiveKvTtl = 24 * 60 * 60; // 1 天
-    } else {
-      switch (expiryOption) {
-        case '5min': effectiveKvTtl = 5 * 60; break;
-        case '30min': effectiveKvTtl = 30 * 60; break;
-        case '1hour': effectiveKvTtl = 60 * 60; break;
-        case '6hour': effectiveKvTtl = 6 * 60 * 60; break;
-        case '1day': effectiveKvTtl = 24 * 60 * 60; break;
-        default: effectiveKvTtl = 24 * 60 * 60; // 默认1天
-      }
-    }
-
-    // KV TTL 有最小值60秒的限制
-    if (effectiveKvTtl < 60) {
-        effectiveKvTtl = 60;
-    }
-
+    const effectiveKvTtl = getEffectiveTTL(expiryOption, readOnce);
+    
     const metadata = { 
-        readOnce, 
-        creationTime, 
-        userExpiryOption: expiryOption // 存储用户选择的过期选项，供前端参考
+      readOnce: Boolean(readOnce), 
+      creationTime, 
+      userExpiryOption: expiryOption
     };
-
+    
     await c.env.SECRETS_KV.put(secretId, encryptedPayload, {
       expirationTtl: effectiveKvTtl,
       metadata: metadata
     });
-
+    
     return c.json({ secretId });
+    
   } catch (e) {
     console.error('Error creating secret:', e);
     return c.json({ error: 'Failed to create secret', details: e.message }, 500);
@@ -91,21 +183,32 @@ app.post('/api/create', async (c) => {
 app.get('/api/secret/:id', async (c) => {
   try {
     const { id } = c.req.param();
-    if (!id || id.length > 32) { // 简单校验ID格式
-        return c.json({ error: 'Invalid secret ID format' }, 400);
+    
+    // 验证ID格式
+    const validation = validateSecretId(id);
+    if (!validation.valid) {
+      return c.json({ error: validation.error }, 400);
     }
-
-    const { value, metadata } = await c.env.SECRETS_KV.getWithMetadata(id);
-
-    if (!value) {
+    
+    const result = await c.env.SECRETS_KV.getWithMetadata(id);
+    
+    if (!result || !result.value) {
       return c.json({ error: 'Secret not found or expired' }, 404);
     }
-
+    
+    const { value, metadata } = result;
+    
+    // 如果是阅后即焚，异步删除
     if (metadata?.readOnce) {
-      c.executionCtx.waitUntil(c.env.SECRETS_KV.delete(id));
+      c.executionCtx.waitUntil(
+        c.env.SECRETS_KV.delete(id).catch(err => {
+          console.error(`Failed to delete read-once secret ${id}:`, err);
+        })
+      );
     }
-
+    
     return c.json({ encryptedPayload: value, metadata });
+    
   } catch (e) {
     console.error('Error retrieving secret:', e);
     return c.json({ error: 'Failed to retrieve secret', details: e.message }, 500);
@@ -117,10 +220,13 @@ app.notFound((c) => {
   if (c.req.path.startsWith('/api/')) {
     return c.json({ error: 'API endpoint not found' }, 404);
   }
-  // For non-API routes, you might serve a static HTML or let another handler manage it
   return c.text('Not Found', 404);
 });
 
+// 全局错误处理
+app.onError((err, c) => {
+  console.error('Unhandled error:', err);
+  return c.json({ error: 'Internal server error', details: err.message }, 500);
+});
 
 export default app;
-
