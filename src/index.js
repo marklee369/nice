@@ -5,7 +5,7 @@ const app = new Hono();
 
 // ==================== 配置常量 ====================
 const CONFIG = {
-  MAX_PAYLOAD_SIZE: 2000000, // 2MB
+  MAX_PAYLOAD_SIZE: 10 * 1024 * 1024, // 2MB
   ID_LENGTH: 16,
   MAX_ID_LENGTH: 32,
   MIN_TTL: 60,
