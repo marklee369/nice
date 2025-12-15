@@ -76,7 +76,7 @@ app.use('/api/*', async (c, next) => {
   // 仅对变更操作或高频读取进行限制，OPTIONS 请求放行
   if (c.req.method === 'OPTIONS') return next();
 
-  if (!c.env.LIMITER_SHORT || !c.env.LIMITER_LONG) {
+  if (!c.env.LIMITER_SHORT || !c.env.LIMITER_OK) {
     console.error('Rate Limiter bindings missing');
     return c.json({ error: 'Server configuration error' }, 500);
   }
@@ -87,7 +87,7 @@ app.use('/api/*', async (c, next) => {
     // 并行检查两个限制器以减少延迟
     const [shortLimit, longLimit] = await Promise.all([
       c.env.LIMITER_SHORT.limit({ key: fingerprint }),
-      c.env.LIMITER_LONG.limit({ key: fingerprint })
+      c.env.LIMITER_OK.limit({ key: fingerprint })
     ]);
 
     if (!shortLimit.success) {
