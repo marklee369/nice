@@ -5,7 +5,7 @@ const app = new Hono();
 
 // ==================== 配置常量 ====================
 const CONFIG = {
-  MAX_PAYLOAD_SIZE: 10 * 1024 * 1024, // 2MB
+  MAX_PAYLOAD_SIZE: 10 * 1024 * 1024, // 10MB (注：Worker 免费版请求体限制 100MB，KV 单值上限 25MB)
   ID_LENGTH: 16,
   MAX_ID_LENGTH: 32,
   MIN_TTL: 60,
@@ -23,160 +23,146 @@ const CONFIG = {
   }
 };
 
-// ==================== CORS 中间件配置 ====================
-app.use('/api/*', cors({
-  origin: (origin) => {
+// ==================== 工具函数 ====================
 
-    if (CONFIG.ALLOWED_ORIGINS.includes(origin)) {
-      return origin;
-    }
-    
-    return null;
-  },
+/**
+ * 生成请求指纹 (SHA-256 of IP + UA)
+ */
+async function getFingerprint(c) {
+  const ip = c.req.header('CF-Connecting-IP') || '0.0.0.0';
+  const ua = c.req.header('User-Agent') || 'unknown';
+  const data = new TextEncoder().encode(`${ip}-${ua}`);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function generateId(length = CONFIG.ID_LENGTH) {
+  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const randomValues = new Uint8Array(length);
+  crypto.getRandomValues(randomValues);
+  return Array.from(randomValues)
+    .map((v) => characters[v % characters.length])
+    .join('');
+}
+
+function validatePayload(encryptedPayload) {
+  if (!encryptedPayload) return { valid: false, error: 'Encrypted payload is required' };
+  if (typeof encryptedPayload !== 'string') return { valid: false, error: 'Invalid payload type' };
+  if (encryptedPayload.length === 0) return { valid: false, error: 'Payload cannot be empty' };
+  if (encryptedPayload.length > CONFIG.MAX_PAYLOAD_SIZE) return { valid: false, error: 'Payload too large' };
+  return { valid: true };
+}
+
+function validateSecretId(id) {
+  if (!id || typeof id !== 'string') return { valid: false, error: 'Invalid ID' };
+  if (id.length > CONFIG.MAX_ID_LENGTH) return { valid: false, error: 'Invalid ID length' };
+  if (!/^[A-Za-z0-9]+$/.test(id)) return { valid: false, error: 'Invalid ID format' };
+  return { valid: true };
+}
+
+// ==================== 中间件 ====================
+
+// CORS
+app.use('/api/*', cors({
+  origin: (origin) => CONFIG.ALLOWED_ORIGINS.includes(origin) ? origin : null,
   allowMethods: ['POST', 'GET', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization'],
   maxAge: 600,
 }));
 
-// ==================== 工具函数 ====================
+// 速率限制中间件
+app.use('/api/*', async (c, next) => {
+  // 仅对变更操作或高频读取进行限制，OPTIONS 请求放行
+  if (c.req.method === 'OPTIONS') return next();
 
-/**
- * 生成唯一ID - 使用加密安全的随机数
- */
-function generateId(length = CONFIG.ID_LENGTH) {
-  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  const charactersLength = characters.length;
-  let result = '';
-  
-  // 使用加密安全的随机数生成器
-  const randomValues = new Uint8Array(length);
-  crypto.getRandomValues(randomValues);
-  
-  for (let i = 0; i < length; i++) {
-    result += characters.charAt(randomValues[i] % charactersLength);
+  if (!c.env.LIMITER_SHORT || !c.env.LIMITER_LONG) {
+    console.error('Rate Limiter bindings missing');
+    return c.json({ error: 'Server configuration error' }, 500);
   }
-  
-  return result;
-}
 
-/**
- * 验证加密负载
- */
-function validatePayload(encryptedPayload) {
-  if (!encryptedPayload) {
-    return { valid: false, error: 'Encrypted payload is required' };
-  }
-  
-  if (typeof encryptedPayload !== 'string') {
-    return { valid: false, error: 'Invalid payload type' };
-  }
-  
-  if (encryptedPayload.length === 0) {
-    return { valid: false, error: 'Payload cannot be empty' };
-  }
-  
-  if (encryptedPayload.length > CONFIG.MAX_PAYLOAD_SIZE) {
-    return { valid: false, error: 'Invalid payload or payload too large' };
-  }
-  
-  return { valid: true };
-}
+  try {
+    const fingerprint = await getFingerprint(c);
 
-/**
- * 验证 Secret ID
- */
-function validateSecretId(id) {
-  if (!id) {
-    return { valid: false, error: 'Secret ID is required' };
-  }
-  
-  if (typeof id !== 'string') {
-    return { valid: false, error: 'Invalid secret ID type' };
-  }
-  
-  if (id.length > CONFIG.MAX_ID_LENGTH) {
-    return { valid: false, error: 'Invalid secret ID format' };
-  }
-  
-  // 只允许字母数字字符
-  if (!/^[A-Za-z0-9]+$/.test(id)) {
-    return { valid: false, error: 'Invalid secret ID format' };
-  }
-  
-  return { valid: true };
-}
+    // 并行检查两个限制器以减少延迟
+    const [shortLimit, longLimit] = await Promise.all([
+      c.env.LIMITER_SHORT.limit({ key: fingerprint }),
+      c.env.LIMITER_LONG.limit({ key: fingerprint })
+    ]);
 
-/**
- * 获取有效的 TTL
- */
-function getEffectiveTTL(expiryOption, readOnce) {
-  let effectiveKvTtl;
-  
-  if (readOnce) {
-    effectiveKvTtl = CONFIG.READ_ONCE_TTL;
-  } else {
-    effectiveKvTtl = CONFIG.TTL_MAP[expiryOption] || CONFIG.DEFAULT_TTL;
+    if (!shortLimit.success) {
+      return c.json({ error: 'Too Many Requests (Rate limit exceeded: 30s)' }, 429);
+    }
+
+    if (!longLimit.success) {
+      return c.json({ error: 'Too Many Requests (Rate limit exceeded: Daily)' }, 429);
+    }
+
+    await next();
+  } catch (e) {
+    console.error('Rate Limit Error:', e);
+    // 降级策略：如果限流服务挂了，允许请求通过，或者返回 500，视业务重要性而定
+    // 这里选择允许通过以保证可用性，或者你可以选择拦截
+    await next(); 
   }
-  
-  // KV TTL 有最小值60秒的限制
-  return Math.max(effectiveKvTtl, CONFIG.MIN_TTL);
-}
+});
 
 // ==================== API 路由 ====================
 
 app.post('/api/create', async (c) => {
   try {
+    // 严格的 JSON 解析错误处理
     let body;
     try {
       body = await c.req.json();
-    } catch (parseError) {
-      return c.json({ error: 'Invalid JSON format' }, 400);
+    } catch {
+      return c.json({ error: 'Invalid JSON' }, 400);
     }
-    
+
     const { encryptedPayload, expiryOption, readOnce } = body;
-    
-    // 验证负载
+
     const validation = validatePayload(encryptedPayload);
-    if (!validation.valid) {
-      return c.json({ error: validation.error }, 400);
-    }
-    
-    // 生成唯一ID（带冲突检测）
+    if (!validation.valid) return c.json({ error: validation.error }, 400);
+
+    // ID 生成与冲突检测
     let secretId;
     let attempts = 0;
-    const maxAttempts = 3;
-    
-    do {
+    while (attempts < 3) {
       secretId = generateId();
-      const existing = await c.env.SECRETS_KV.get(secretId);
+      // 使用 list 或 peek 检查可能比 get 更轻量，但 get 强一致性更好
+      const existing = await c.env.SECRETS_KV.get(secretId); 
       if (!existing) break;
       attempts++;
-    } while (attempts < maxAttempts);
-    
-    if (attempts >= maxAttempts) {
-      console.error('Failed to generate unique ID after multiple attempts');
-      return c.json({ error: 'Failed to create secret' }, 500);
     }
-    
-    const creationTime = Date.now();
-    const effectiveKvTtl = getEffectiveTTL(expiryOption, readOnce);
-    
-    const metadata = { 
-      readOnce: Boolean(readOnce), 
-      creationTime, 
+
+    if (attempts >= 3) {
+      console.error('ID collision exhaust');
+      return c.json({ error: 'Service busy, please try again' }, 503);
+    }
+
+    // 计算 TTL
+    const effectiveKvTtl = Math.max(
+      readOnce ? CONFIG.READ_ONCE_TTL : (CONFIG.TTL_MAP[expiryOption] || CONFIG.DEFAULT_TTL),
+      CONFIG.MIN_TTL
+    );
+
+    const metadata = {
+      readOnce: Boolean(readOnce),
+      creationTime: Date.now(),
       userExpiryOption: expiryOption
     };
-    
+
     await c.env.SECRETS_KV.put(secretId, encryptedPayload, {
       expirationTtl: effectiveKvTtl,
       metadata: metadata
     });
-    
+
     return c.json({ secretId });
-    
+
   } catch (e) {
-    console.error('Error creating secret:', e);
-    return c.json({ error: 'Failed to create secret', details: e.message }, 500);
+    console.error('Create Error:', e);
+    // 安全修复：不返回 e.message
+    return c.json({ error: 'Failed to create secret' }, 500);
   }
 });
 
@@ -184,49 +170,40 @@ app.get('/api/secret/:id', async (c) => {
   try {
     const { id } = c.req.param();
     
-    // 验证ID格式
     const validation = validateSecretId(id);
-    if (!validation.valid) {
-      return c.json({ error: validation.error }, 400);
-    }
-    
+    if (!validation.valid) return c.json({ error: validation.error }, 400);
+
     const result = await c.env.SECRETS_KV.getWithMetadata(id);
-    
+
     if (!result || !result.value) {
       return c.json({ error: 'Secret not found or expired' }, 404);
     }
-    
+
     const { value, metadata } = result;
-    
-    // 如果是阅后即焚，异步删除
+
     if (metadata?.readOnce) {
+      // 关键：waitUntil 确保响应返回后继续执行删除，不阻塞用户
       c.executionCtx.waitUntil(
-        c.env.SECRETS_KV.delete(id).catch(err => {
-          console.error(`Failed to delete read-once secret ${id}:`, err);
-        })
+        c.env.SECRETS_KV.delete(id).catch(err => console.error('Delete Error:', err))
       );
     }
-    
+
     return c.json({ encryptedPayload: value, metadata });
-    
+
   } catch (e) {
-    console.error('Error retrieving secret:', e);
-    return c.json({ error: 'Failed to retrieve secret', details: e.message }, 500);
+    console.error('Retrieve Error:', e);
+    return c.json({ error: 'Failed to retrieve secret' }, 500);
   }
 });
 
-// 404 Handler for API routes
-app.notFound((c) => {
-  if (c.req.path.startsWith('/api/')) {
-    return c.json({ error: 'API endpoint not found' }, 404);
-  }
-  return c.text('Not Found', 404);
-});
+// 404
+app.notFound((c) => c.json({ error: 'Not Found' }, 404));
 
-// 全局错误处理
+// 全局错误
 app.onError((err, c) => {
-  console.error('Unhandled error:', err);
-  return c.json({ error: 'Internal server error', details: err.message }, 500);
+  console.error('Global Error:', err);
+  // 安全修复：隐藏内部错误详情
+  return c.json({ error: 'Internal Server Error' }, 500);
 });
 
 export default app;
